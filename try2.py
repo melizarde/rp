@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import re
 import io
+import zipfile
 
 # --- Helper Functions ---
 def contains_special_chars(s):
@@ -23,7 +24,7 @@ def process_file(uploaded_file, delete_special_rows=False):
         elif ext == 'csv':
             df = pd.read_csv(uploaded_file, dtype=str, keep_default_na=False)
         else:
-            return None, f"Unsupported file format: {uploaded_file.name}"
+            return None, None, None, f"Unsupported file format: {uploaded_file.name}"
 
         # Detect special characters
         special_char_mask = df.apply(lambda row: row.astype(str).apply(contains_special_chars).any(), axis=1)
@@ -38,7 +39,7 @@ def process_file(uploaded_file, delete_special_rows=False):
         corp_col = next((c for c in df.columns if 'corporate' in c.lower()), None)
 
         if not unit_col:
-            return None, f"No 'Unit' column found in {uploaded_file.name}"
+            return None, problem_rows, None, f"No 'Unit' column found in {uploaded_file.name}"
 
         df['_CleanUnit'] = df[unit_col].apply(lambda x: x.strip())
         duplicate_units = df[df.duplicated('_CleanUnit', keep=False)]
@@ -66,13 +67,27 @@ def process_file(uploaded_file, delete_special_rows=False):
         df_unique.drop(columns=['_CleanUnit'], inplace=True)
         df_unique.replace({'N/A': '', 'n/a': '', 'na': '', '': ''}, inplace=True)
 
-        # Convert to CSV for download
-        output = io.StringIO()
-        df_unique.to_csv(output, index=False)
-        return output.getvalue(), f"✅ Processed {uploaded_file.name} | Unique Units: {len(df_unique)}"
+        # Summary report
+        summary = {
+            "Original Rows": len(df) + len(problem_rows),
+            "Rows with Special Characters": len(problem_rows),
+            "Rows After Cleaning": len(df_unique),
+            "Duplicate Units Found": len(duplicate_units)
+        }
+
+        # Convert cleaned data to CSV
+        output_cleaned = io.StringIO()
+        df_unique.to_csv(output_cleaned, index=False)
+
+        # Convert problematic rows to CSV
+        output_problem = io.StringIO()
+        if not problem_rows.empty:
+            problem_rows.to_csv(output_problem, index=False)
+
+        return output_cleaned.getvalue(), problem_rows, output_problem.getvalue(), summary
 
     except Exception as e:
-        return None, f"❌ Error: {e}"
+        return None, None, None, f"❌ Error: {e}"
 
 # --- Streamlit UI ---
 st.title("🏢 Unit Cleaner Tool (Streamlit)")
@@ -80,9 +95,39 @@ uploaded_files = st.file_uploader("Upload Excel or CSV files", type=['xlsx', 'cs
 
 if uploaded_files:
     delete_special = st.checkbox("Delete rows with special characters (e.g., ñ, #, @)?")
-    for file in uploaded_files:
-        st.subheader(f"File: {file.name}")
-        csv_data, message = process_file(file, delete_special_rows=delete_special)
-        st.write(message)
-        if csv_data:
-            st.download_button(label="Download Cleaned File", data=csv_data, file_name=f"{file.name.split('.')[0]}_cleaned.csv", mime="text/csv")
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+        for file in uploaded_files:
+            st.subheader(f"File: {file.name}")
+            cleaned_csv, problem_rows, problem_csv, summary = process_file(file, delete_special_rows=delete_special)
+
+            if isinstance(summary, dict):
+                st.write("### Summary Report")
+                st.json(summary)
+            else:
+                st.error(summary)
+                continue
+
+            # Show problematic rows if any
+            if problem_rows is not None and not problem_rows.empty:
+                st.warning(f"{len(problem_rows)} rows contain special characters:")
+                st.dataframe(problem_rows)
+                st.download_button(label=f"Download Problematic Rows ({file.name})",
+                                   data=problem_csv,
+                                   file_name=f"{file.name.split('.')[0]}_problematic.csv",
+                                   mime="text/csv")
+
+            # Add cleaned file to ZIP
+            if cleaned_csv:
+                zip_file.writestr(f"{file.name.split('.')[0]}_cleaned.csv", cleaned_csv)
+                st.download_button(label=f"Download Cleaned File ({file.name})",
+                                   data=cleaned_csv,
+                                   file_name=f"{file.name.split('.')[0]}_cleaned.csv",
+                                   mime="text/csv")
+
+    # Multi-file ZIP download
+    if zip_buffer.getbuffer().nbytes > 0:
+        st.download_button(label="📦 Download All Cleaned Files (ZIP)",
+                           data=zip_buffer.getvalue(),
+                           file_name="cleaned_files.zip",
+                           mime="application/zip")
